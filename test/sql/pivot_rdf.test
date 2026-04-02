@@ -1,5 +1,5 @@
 # name: test/sql/pivot_rdf.test
-# description: bisect step 2 — real bind (profiling) + stub scan
+# description: bisect step 3 — real bind + real scan, all VARCHAR
 # group: [sql]
 
 require rdf
@@ -10,8 +10,8 @@ SELECT * FROM pivot_rdf('not_exist.nt');
 ----
 IO Error: No files found matching: not_exist.nt
 
-# Test 2: profiling + schema works, scan returns 0 rows
+# Test 2: full scan with all-VARCHAR columns
 query I
 SELECT COUNT(*) FROM pivot_rdf('test/rdf/tests.nt');
 ----
-0
+4
