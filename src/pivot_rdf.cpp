@@ -180,12 +180,17 @@ static Value StringToTypedValue(const std::string &str, const LogicalType &targe
 // State structs
 // ============================================================
 
+struct PivotColInfo {
+	std::string predicate;
+	LogicalType col_type;
+};
+
 struct PivotRDFBindData : public TableFunctionData {
 	vector<string> file_paths;
 	ITriplesBuffer::FileType file_type = ITriplesBuffer::UNKNOWN;
 	bool strict_parsing = true;
 	bool expand_prefixes = false;
-	std::vector<PivotColumn> columns;
+	std::vector<PivotColInfo> columns;
 	std::unordered_map<std::string, idx_t> pred_to_col;
 };
 
@@ -290,8 +295,13 @@ static unique_ptr<FunctionData> PivotRDFBind(ClientContext &context, TableFuncti
 		pred_uris.push_back(kv.first);
 	std::sort(pred_uris.begin(), pred_uris.end());
 
-	for (const auto &pred : pred_uris)
-		result->columns.push_back(BuildPivotColumn(pred, profiles.at(pred)));
+	for (const auto &pred : pred_uris) {
+		PivotColumn full_col = BuildPivotColumn(pred, profiles.at(pred));
+		PivotColInfo info;
+		info.predicate = full_col.predicate;
+		info.col_type = full_col.col_type;
+		result->columns.push_back(info);
+	}
 	for (idx_t i = 0; i < result->columns.size(); i++)
 		result->pred_to_col[result->columns[i].predicate] = i;
 
@@ -345,14 +355,8 @@ static void EmitRow(PivotRDFLocalState &state, const PivotRDFBindData &bind_data
 	for (idx_t i = 0; i < bind_data.columns.size(); i++) {
 		const auto &col = bind_data.columns[i];
 		if (state.col_has_value[i]) {
-			// For SCALAR: convert to typed value. For MAP/LIST: store as VARCHAR.
-			if (col.kind == PivotColKind::SCALAR) {
-				output.SetValue(2 + i, out_idx,
-				                StringToTypedValue(state.col_values[i], col.elem_type));
-			} else {
-				// MAP/LIST columns: just set NULL for now (bisect: skip complex types)
-				output.SetValue(2 + i, out_idx, Value(col.col_type));
-			}
+			output.SetValue(2 + i, out_idx,
+			                StringToTypedValue(state.col_values[i], col.col_type));
 		} else {
 			output.SetValue(2 + i, out_idx, Value(col.col_type)); // typed NULL
 		}
