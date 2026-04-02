@@ -107,7 +107,10 @@ static PivotColumn BuildPivotColumn(const std::string &predicate, const Predicat
 		LogicalType lt = TypeNameToLogical(name);
 		bool already = false;
 		for (const auto &dt : distinct_types) {
-			if (dt == lt) { already = true; break; }
+			if (dt == lt) {
+				already = true;
+				break;
+			}
 		}
 		if (!already) {
 			distinct_types.push_back(lt);
@@ -200,7 +203,9 @@ struct PivotRDFGlobalState : public GlobalTableFunctionState {
 	std::mutex lock;
 	idx_t next_file = 0;
 	idx_t file_count = 0;
-	idx_t MaxThreads() const override { return file_count; }
+	idx_t MaxThreads() const override {
+		return file_count;
+	}
 };
 
 struct PivotColAccum {
@@ -344,8 +349,7 @@ static unique_ptr<GlobalTableFunctionState> PivotRDFGlobalInit(ClientContext &, 
 	return state;
 }
 
-static unique_ptr<LocalTableFunctionState> PivotRDFLocalInit(ExecutionContext &context,
-                                                             TableFunctionInitInput &input,
+static unique_ptr<LocalTableFunctionState> PivotRDFLocalInit(ExecutionContext &context, TableFunctionInitInput &input,
                                                              GlobalTableFunctionState *) {
 	auto &bind_data = (PivotRDFBindData &)*input.bind_data;
 	auto state = make_uniq<PivotRDFLocalState>();
@@ -395,8 +399,7 @@ static Value BuildColValue(const PivotColAccum &accum, const PivotColInfo &col) 
 	return Value(col.col_type);
 }
 
-static void EmitRow(PivotRDFLocalState &state, const PivotRDFBindData &bind_data,
-                    DataChunk &output, idx_t out_idx) {
+static void EmitRow(PivotRDFLocalState &state, const PivotRDFBindData &bind_data, DataChunk &output, idx_t out_idx) {
 	output.SetValue(0, out_idx, Value(state.current_graph));
 	output.SetValue(1, out_idx, Value(state.current_subject));
 	for (idx_t i = 0; i < bind_data.columns.size(); i++) {
@@ -450,8 +453,8 @@ static void PivotRDFFunc(ClientContext &context, TableFunctionInput &input, Data
 
 			const string &file_path = bind_data.file_paths[file_idx];
 			try {
-				auto new_ib = PivotOpenFile(file_path, bind_data.file_type, fs,
-				                            bind_data.strict_parsing, bind_data.expand_prefixes);
+				auto new_ib = PivotOpenFile(file_path, bind_data.file_type, fs, bind_data.strict_parsing,
+				                            bind_data.expand_prefixes);
 				new_ib->StartParse();
 				vector<column_t> all_cols = {0, 1, 2, 3, 4, 5};
 				new_ib->SetColumnIds(all_cols);
