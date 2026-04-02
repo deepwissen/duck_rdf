@@ -1,5 +1,5 @@
 # name: test/sql/pivot_rdf.test
-# description: bisect step 4 — real types (HUGEINT etc) but no MAP/LIST/UNION
+# description: bisect step 5 — full BuildPivotColumn schema (MAP/LIST types in schema) + scalar scan
 # group: [sql]
 
 require rdf
@@ -9,13 +9,12 @@ SELECT * FROM pivot_rdf('not_exist.nt');
 ----
 IO Error: No files found matching: not_exist.nt
 
-# tests.nt has 4 subjects — foaf:age should be HUGEINT
+# tests.nt — all predicates are SCALAR, so schema has no MAP/LIST
 query I
 SELECT COUNT(*) FROM pivot_rdf('test/rdf/tests.nt');
 ----
 4
 
-# Check typed value works
 query I
 SELECT "http://xmlns.com/foaf/0.1/age"
 FROM pivot_rdf('test/rdf/tests.nt')

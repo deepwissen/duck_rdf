@@ -15,10 +15,30 @@
 #include <unordered_map>
 #include <vector>
 
+using namespace std;
+
 namespace duckdb {
 
 // ============================================================
-// Type mapping (simplified: no MAP, LIST, UNION)
+// Column kind
+// ============================================================
+
+enum class PivotColKind {
+	SCALAR,
+	LANG_MAP,
+	LIST,
+};
+
+struct PivotColumn {
+	std::string predicate;
+	LogicalType col_type;
+	LogicalType elem_type;
+	PivotColKind kind;
+	child_list_t<LogicalType> union_members;
+};
+
+// ============================================================
+// Type helpers
 // ============================================================
 
 static LogicalType TypeNameToLogical(const std::string &name) {
@@ -28,12 +48,20 @@ static LogicalType TypeNameToLogical(const std::string &name) {
 		return LogicalType::BOOLEAN;
 	if (name == "TINYINT")
 		return LogicalType::TINYINT;
+	if (name == "UTINYINT")
+		return LogicalType::UTINYINT;
 	if (name == "SMALLINT")
 		return LogicalType::SMALLINT;
+	if (name == "USMALLINT")
+		return LogicalType::USMALLINT;
 	if (name == "INTEGER")
 		return LogicalType::INTEGER;
+	if (name == "UINTEGER")
+		return LogicalType::UINTEGER;
 	if (name == "BIGINT")
 		return LogicalType::BIGINT;
+	if (name == "UBIGINT")
+		return LogicalType::UBIGINT;
 	if (name == "HUGEINT")
 		return LogicalType::HUGEINT;
 	if (name == "FLOAT")
@@ -44,31 +72,78 @@ static LogicalType TypeNameToLogical(const std::string &name) {
 		return LogicalType::DOUBLE;
 	if (name == "DATE")
 		return LogicalType::DATE;
+	if (name == "TIME")
+		return LogicalType::TIME;
 	if (name == "TIMESTAMP")
 		return LogicalType::TIMESTAMP;
+	if (name == "TIMESTAMP WITH TIME ZONE")
+		return LogicalType::TIMESTAMP_TZ;
+	if (name == "INTERVAL")
+		return LogicalType::INTERVAL;
+	if (name == "BLOB")
+		return LogicalType::BLOB;
 	return LogicalType::VARCHAR;
 }
 
-// Derive a single scalar LogicalType for a predicate from its profile.
-// No MAP, LIST, or UNION — just pick the single most common type, or VARCHAR if mixed.
-static LogicalType DeriveScalarType(const PredicateProfile &profile) {
+static PivotColumn BuildPivotColumn(const std::string &predicate, const PredicateProfile &profile) {
+	PivotColumn col;
+	col.predicate = predicate;
+
+	bool use_lang_map = profile.has_lang_tagged && !profile.has_non_lang_literal;
+	if (use_lang_map) {
+		col.kind = PivotColKind::LANG_MAP;
+		col.elem_type = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
+		col.col_type = col.elem_type;
+		return col;
+	}
+
+	std::vector<std::string> type_names;
+	type_names.reserve(profile.type_stats.size());
+	for (const auto &kv : profile.type_stats)
+		type_names.push_back(kv.first);
+	std::sort(type_names.begin(), type_names.end());
+
 	std::vector<LogicalType> distinct_types;
-	for (const auto &kv : profile.type_stats) {
-		LogicalType lt = TypeNameToLogical(kv.first);
+	std::vector<std::string> distinct_names;
+	for (const auto &name : type_names) {
+		LogicalType lt = TypeNameToLogical(name);
 		bool already = false;
 		for (const auto &dt : distinct_types) {
 			if (dt == lt) { already = true; break; }
 		}
-		if (!already)
+		if (!already) {
 			distinct_types.push_back(lt);
+			if (lt == LogicalType::VARCHAR)
+				distinct_names.push_back("varchar");
+			else
+				distinct_names.push_back(name);
+		}
 	}
-	if (distinct_types.size() == 1)
-		return distinct_types[0];
-	// Mixed types -> VARCHAR
-	return LogicalType::VARCHAR;
+
+	LogicalType elem;
+	child_list_t<LogicalType> union_members;
+	if (distinct_types.size() == 1) {
+		elem = distinct_types[0];
+	} else {
+		for (size_t i = 0; i < distinct_types.size(); i++)
+			union_members.push_back(make_pair(distinct_names[i], distinct_types[i]));
+		elem = LogicalType::UNION(union_members);
+	}
+
+	if (profile.is_multi_valued) {
+		col.kind = PivotColKind::LIST;
+		col.elem_type = elem;
+		col.col_type = LogicalType::LIST(elem);
+		col.union_members = union_members;
+	} else {
+		col.kind = PivotColKind::SCALAR;
+		col.elem_type = elem;
+		col.col_type = elem;
+		col.union_members = union_members;
+	}
+	return col;
 }
 
-// Convert string to typed Value
 static Value StringToTypedValue(const std::string &str, const LogicalType &target) {
 	if (target == LogicalType::VARCHAR)
 		return Value(str);
@@ -77,12 +152,20 @@ static Value StringToTypedValue(const std::string &str, const LogicalType &targe
 	try {
 		if (target == LogicalType::TINYINT)
 			return Value::TINYINT(static_cast<int8_t>(std::stoi(str)));
+		if (target == LogicalType::UTINYINT)
+			return Value::UTINYINT(static_cast<uint8_t>(std::stoul(str)));
 		if (target == LogicalType::SMALLINT)
 			return Value::SMALLINT(static_cast<int16_t>(std::stoi(str)));
+		if (target == LogicalType::USMALLINT)
+			return Value::USMALLINT(static_cast<uint16_t>(std::stoul(str)));
 		if (target == LogicalType::INTEGER)
 			return Value::INTEGER(static_cast<int32_t>(std::stoi(str)));
+		if (target == LogicalType::UINTEGER)
+			return Value::UINTEGER(static_cast<uint32_t>(std::stoul(str)));
 		if (target == LogicalType::BIGINT)
 			return Value::BIGINT(static_cast<int64_t>(std::stoll(str)));
+		if (target == LogicalType::UBIGINT)
+			return Value::UBIGINT(static_cast<uint64_t>(std::stoull(str)));
 		if (target == LogicalType::HUGEINT)
 			return Value::HUGEINT(static_cast<int64_t>(std::stoll(str)));
 		if (target == LogicalType::FLOAT)
@@ -99,17 +182,12 @@ static Value StringToTypedValue(const std::string &str, const LogicalType &targe
 // State structs
 // ============================================================
 
-struct PivotColInfo {
-	std::string predicate;
-	LogicalType col_type;
-};
-
 struct PivotRDFBindData : public TableFunctionData {
 	vector<string> file_paths;
 	ITriplesBuffer::FileType file_type = ITriplesBuffer::UNKNOWN;
 	bool strict_parsing = true;
 	bool expand_prefixes = false;
-	std::vector<PivotColInfo> columns;
+	std::vector<PivotColumn> columns;
 	std::unordered_map<std::string, idx_t> pred_to_col;
 };
 
@@ -129,7 +207,6 @@ struct PivotRDFLocalState : public LocalTableFunctionState {
 	std::string current_subject;
 	bool has_pending = false;
 
-	// Per-column: first value seen as string + whether set
 	std::vector<std::string> col_values;
 	std::vector<bool> col_has_value;
 };
@@ -179,6 +256,10 @@ static unique_ptr<FunctionData> PivotRDFBind(ClientContext &context, TableFuncti
 	if (sp_it != input.named_parameters.end())
 		result->strict_parsing = sp_it->second.GetValue<bool>();
 
+	auto pe_it = input.named_parameters.find("prefix_expansion");
+	if (pe_it != input.named_parameters.end())
+		result->expand_prefixes = pe_it->second.GetValue<bool>();
+
 	// Profile
 	RDFProfileAccumulator accumulator;
 	for (auto &file_path : result->file_paths) {
@@ -204,19 +285,15 @@ static unique_ptr<FunctionData> PivotRDFBind(ClientContext &context, TableFuncti
 		}
 	}
 
-	// Build columns with real types (but no MAP/LIST/UNION)
+	// Build columns with full BuildPivotColumn (MAP/LIST/UNION schema)
 	const auto &profiles = accumulator.GetProfiles();
 	std::vector<std::string> pred_uris;
 	for (const auto &kv : profiles)
 		pred_uris.push_back(kv.first);
 	std::sort(pred_uris.begin(), pred_uris.end());
 
-	for (const auto &pred : pred_uris) {
-		PivotColInfo col;
-		col.predicate = pred;
-		col.col_type = DeriveScalarType(profiles.at(pred));
-		result->columns.push_back(col);
-	}
+	for (const auto &pred : pred_uris)
+		result->columns.push_back(BuildPivotColumn(pred, profiles.at(pred)));
 	for (idx_t i = 0; i < result->columns.size(); i++)
 		result->pred_to_col[result->columns[i].predicate] = i;
 
@@ -260,7 +337,7 @@ static unique_ptr<LocalTableFunctionState> PivotRDFLocalInit(ExecutionContext &c
 }
 
 // ============================================================
-// Helpers
+// Helpers — scan emits typed scalars, NULL for missing, ignores MAP/LIST
 // ============================================================
 
 static void EmitRow(PivotRDFLocalState &state, const PivotRDFBindData &bind_data,
@@ -268,11 +345,18 @@ static void EmitRow(PivotRDFLocalState &state, const PivotRDFBindData &bind_data
 	output.SetValue(0, out_idx, Value(state.current_graph));
 	output.SetValue(1, out_idx, Value(state.current_subject));
 	for (idx_t i = 0; i < bind_data.columns.size(); i++) {
+		const auto &col = bind_data.columns[i];
 		if (state.col_has_value[i]) {
-			output.SetValue(2 + i, out_idx,
-			                StringToTypedValue(state.col_values[i], bind_data.columns[i].col_type));
+			// For SCALAR: convert to typed value. For MAP/LIST: store as VARCHAR.
+			if (col.kind == PivotColKind::SCALAR) {
+				output.SetValue(2 + i, out_idx,
+				                StringToTypedValue(state.col_values[i], col.elem_type));
+			} else {
+				// MAP/LIST columns: just set NULL for now (bisect: skip complex types)
+				output.SetValue(2 + i, out_idx, Value(col.col_type));
+			}
 		} else {
-			output.SetValue(2 + i, out_idx, Value(bind_data.columns[i].col_type)); // typed NULL
+			output.SetValue(2 + i, out_idx, Value(col.col_type)); // typed NULL
 		}
 	}
 }
