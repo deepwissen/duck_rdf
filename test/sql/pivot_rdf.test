@@ -1,17 +1,17 @@
 # name: test/sql/pivot_rdf.test
-# description: test pivot_rdf extension function — minimal bisect
+# description: test pivot_rdf stub — isolate Windows crash
 # group: [sql]
 
 require rdf
 
-# Test 1: error handling (bind only, throws before profiling)
+# Test 1: error handling
 statement error
 SELECT * FROM pivot_rdf('not_exist.nt');
 ----
 IO Error: No files found matching: not_exist.nt
 
-# Test 2: bind + scan with COUNT (no DESCRIBE)
+# Test 2: stub returns 2 rows
 query I
 SELECT COUNT(*) FROM pivot_rdf('test/rdf/tests.nt');
 ----
-4
+2
