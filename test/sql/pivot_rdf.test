@@ -1,5 +1,5 @@
 # name: test/sql/pivot_rdf.test
-# description: test pivot_rdf stub — isolate Windows crash
+# description: bisect step 2 — real bind (profiling) + stub scan
 # group: [sql]
 
 require rdf
@@ -10,8 +10,8 @@ SELECT * FROM pivot_rdf('not_exist.nt');
 ----
 IO Error: No files found matching: not_exist.nt
 
-# Test 2: stub returns 2 rows
+# Test 2: profiling + schema works, scan returns 0 rows
 query I
 SELECT COUNT(*) FROM pivot_rdf('test/rdf/tests.nt');
 ----
-2
+0
