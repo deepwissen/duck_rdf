@@ -15,8 +15,6 @@
 #include <unordered_map>
 #include <vector>
 
-using namespace std;
-
 namespace duckdb {
 
 // ============================================================
@@ -126,7 +124,7 @@ static PivotColumn BuildPivotColumn(const std::string &predicate, const Predicat
 		elem = distinct_types[0];
 	} else {
 		for (size_t i = 0; i < distinct_types.size(); i++)
-			union_members.push_back(make_pair(distinct_names[i], distinct_types[i]));
+			union_members.push_back(std::make_pair(distinct_names[i], distinct_types[i]));
 		elem = LogicalType::UNION(union_members);
 	}
 
