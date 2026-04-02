@@ -235,6 +235,9 @@ static Value StringToValue(const std::string &str, const std::string &datatype, 
 static Value BuildColValue(const PivotColAccum &accum, const PivotColumn &col) {
 	switch (col.kind) {
 	case PivotColKind::LANG_MAP: {
+		if (accum.lang_map.empty()) {
+			return Value(col.col_type); // typed NULL for missing predicate
+		}
 		// Build MAP(VARCHAR, VARCHAR)
 		duckdb::vector<Value> keys, vals;
 		keys.reserve(accum.lang_map.size());
@@ -255,8 +258,7 @@ static Value BuildColValue(const PivotColAccum &accum, const PivotColumn &col) {
 	}
 	case PivotColKind::LIST: {
 		if (accum.values.empty()) {
-			duckdb::vector<Value> empty;
-			return Value::LIST(col.elem_type, empty);
+			return Value(col.col_type); // typed NULL for missing predicate
 		}
 		if (col.union_members.empty()) {
 			// LIST of simple type
@@ -440,12 +442,18 @@ static unique_ptr<GlobalTableFunctionState> PivotRDFGlobalInit(ClientContext & /
 // Local init
 // ============================================================
 
-static unique_ptr<LocalTableFunctionState> PivotRDFLocalInit(ExecutionContext & /*context*/,
+static unique_ptr<LocalTableFunctionState> PivotRDFLocalInit(ExecutionContext &context,
                                                              TableFunctionInitInput &input,
                                                              GlobalTableFunctionState * /*global*/) {
 	auto &bind_data = (PivotRDFBindData &)*input.bind_data;
 	auto state = make_uniq<PivotRDFLocalState>();
 	state->col_accum.resize(bind_data.columns.size());
+
+	// Initialise the intermediate 6-col raw triple buffer here (not lazily in scan)
+	vector<LogicalType> raw_types(6, LogicalType::VARCHAR);
+	state->raw_chunk.Initialize(Allocator::Get(context.client), raw_types);
+	state->raw_chunk_initialized = true;
+
 	return state;
 }
 
@@ -490,10 +498,16 @@ static void AccumulateTriple(PivotRDFLocalState &state, const PivotRDFBindData &
 			if (col.union_members.empty()) {
 				accum.values.push_back(StringToValue(object, datatype, lang, col.elem_type));
 			} else {
-				// UNION scalar: find tag index
-				ObjectKind ok =
-				    lang.empty() ? (datatype.empty() ? ObjectKind::LITERAL : ObjectKind::LITERAL) : ObjectKind::LITERAL;
-				// Determine the type name from context
+				// UNION scalar: determine ObjectKind from triple data
+				ObjectKind ok = ObjectKind::LITERAL;
+				if (datatype.empty() && lang.empty()) {
+					// No datatype and no lang tag — could be IRI or blank
+					if (object.size() >= 2 && object[0] == '_' && object[1] == ':') {
+						ok = ObjectKind::BLANK;
+					} else if (!object.empty() && object[0] != '"') {
+						ok = ObjectKind::IRI;
+					}
+				}
 				std::string type_name = XsdToDuckDBType(datatype, lang, ok);
 				LogicalType lt = TypeNameToLogical(type_name);
 				idx_t tag = 0;
@@ -514,8 +528,15 @@ static void AccumulateTriple(PivotRDFLocalState &state, const PivotRDFBindData &
 		if (col.union_members.empty()) {
 			accum.values.push_back(StringToValue(object, datatype, lang, col.elem_type));
 		} else {
-			// LIST<UNION>: determine tag, store raw value and tag separately
+			// LIST<UNION>: determine ObjectKind from triple data
 			ObjectKind ok = ObjectKind::LITERAL;
+			if (datatype.empty() && lang.empty()) {
+				if (object.size() >= 2 && object[0] == '_' && object[1] == ':') {
+					ok = ObjectKind::BLANK;
+				} else if (!object.empty() && object[0] != '"') {
+					ok = ObjectKind::IRI;
+				}
+			}
 			std::string type_name = XsdToDuckDBType(datatype, lang, ok);
 			LogicalType lt = TypeNameToLogical(type_name);
 			idx_t tag = 0;
@@ -552,14 +573,7 @@ static void PivotRDFFunc(ClientContext &context, TableFunctionInput &input, Data
 	auto &bind_data = (PivotRDFBindData &)*input.bind_data;
 	auto &fs = FileSystem::GetFileSystem(context);
 
-	// Lazily initialise the raw 6-col chunk used as an intermediate triple buffer.
-	if (!state.raw_chunk_initialized) {
-		vector<LogicalType> raw_types(6, LogicalType::VARCHAR);
-		state.raw_chunk.Initialize(Allocator::Get(context), raw_types);
-		// All 6 columns needed for pivot (predicate, object, datatype, lang, subject, graph)
-		vector<column_t> all_cols = {0, 1, 2, 3, 4, 5};
-		state.raw_chunk_initialized = true;
-	}
+	// raw_chunk is initialised in PivotRDFLocalInit
 
 	idx_t out_idx = 0;
 
