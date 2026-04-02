@@ -183,6 +183,8 @@ static Value StringToTypedValue(const std::string &str, const LogicalType &targe
 struct PivotColInfo {
 	std::string predicate;
 	LogicalType col_type;
+	LogicalType elem_type;
+	PivotColKind kind = PivotColKind::SCALAR;
 };
 
 struct PivotRDFBindData : public TableFunctionData {
@@ -201,6 +203,18 @@ struct PivotRDFGlobalState : public GlobalTableFunctionState {
 	idx_t MaxThreads() const override { return file_count; }
 };
 
+struct PivotColAccum {
+	// For LANG_MAP: key=lang, value=string
+	std::unordered_map<std::string, std::string> lang_map;
+	// For SCALAR: first value. For LIST: all values.
+	std::vector<std::string> values;
+
+	void Reset() {
+		lang_map.clear();
+		values.clear();
+	}
+};
+
 struct PivotRDFLocalState : public LocalTableFunctionState {
 	std::unique_ptr<ITriplesBuffer> ib;
 	DataChunk raw_chunk;
@@ -210,8 +224,7 @@ struct PivotRDFLocalState : public LocalTableFunctionState {
 	std::string current_subject;
 	bool has_pending = false;
 
-	std::vector<std::string> col_values;
-	std::vector<bool> col_has_value;
+	std::vector<PivotColAccum> col_accum;
 };
 
 // ============================================================
@@ -300,6 +313,8 @@ static unique_ptr<FunctionData> PivotRDFBind(ClientContext &context, TableFuncti
 		PivotColInfo info;
 		info.predicate = full_col.predicate;
 		info.col_type = full_col.col_type;
+		info.elem_type = full_col.elem_type;
+		info.kind = full_col.kind;
 		result->columns.push_back(info);
 	}
 	for (idx_t i = 0; i < result->columns.size(); i++)
@@ -334,9 +349,7 @@ static unique_ptr<LocalTableFunctionState> PivotRDFLocalInit(ExecutionContext &c
                                                              GlobalTableFunctionState *) {
 	auto &bind_data = (PivotRDFBindData &)*input.bind_data;
 	auto state = make_uniq<PivotRDFLocalState>();
-	idx_t ncols = bind_data.columns.size();
-	state->col_values.resize(ncols);
-	state->col_has_value.resize(ncols, false);
+	state->col_accum.resize(bind_data.columns.size());
 
 	vector<LogicalType> raw_types(6, LogicalType::VARCHAR);
 	state->raw_chunk.Initialize(Allocator::Get(context.client), raw_types);
@@ -348,26 +361,52 @@ static unique_ptr<LocalTableFunctionState> PivotRDFLocalInit(ExecutionContext &c
 // Helpers — scan emits typed scalars, NULL for missing, ignores MAP/LIST
 // ============================================================
 
+static Value BuildColValue(const PivotColAccum &accum, const PivotColInfo &col) {
+	switch (col.kind) {
+	case PivotColKind::LANG_MAP: {
+		if (accum.lang_map.empty())
+			return Value(col.col_type); // typed NULL
+		duckdb::vector<Value> keys, vals;
+		keys.reserve(accum.lang_map.size());
+		vals.reserve(accum.lang_map.size());
+		std::vector<std::pair<std::string, std::string>> sorted(accum.lang_map.begin(), accum.lang_map.end());
+		std::sort(sorted.begin(), sorted.end());
+		for (const auto &kv : sorted) {
+			keys.emplace_back(Value(kv.first));
+			vals.emplace_back(Value(kv.second));
+		}
+		return Value::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR, keys, vals);
+	}
+	case PivotColKind::SCALAR: {
+		if (accum.values.empty())
+			return Value(col.col_type); // typed NULL
+		return StringToTypedValue(accum.values[0], col.elem_type);
+	}
+	case PivotColKind::LIST: {
+		if (accum.values.empty())
+			return Value(col.col_type); // typed NULL
+		duckdb::vector<Value> list_vals;
+		list_vals.reserve(accum.values.size());
+		for (const auto &v : accum.values)
+			list_vals.emplace_back(StringToTypedValue(v, col.elem_type));
+		return Value::LIST(col.elem_type, list_vals);
+	}
+	}
+	return Value(col.col_type);
+}
+
 static void EmitRow(PivotRDFLocalState &state, const PivotRDFBindData &bind_data,
                     DataChunk &output, idx_t out_idx) {
 	output.SetValue(0, out_idx, Value(state.current_graph));
 	output.SetValue(1, out_idx, Value(state.current_subject));
 	for (idx_t i = 0; i < bind_data.columns.size(); i++) {
-		const auto &col = bind_data.columns[i];
-		if (state.col_has_value[i]) {
-			output.SetValue(2 + i, out_idx,
-			                StringToTypedValue(state.col_values[i], col.col_type));
-		} else {
-			output.SetValue(2 + i, out_idx, Value(col.col_type)); // typed NULL
-		}
+		output.SetValue(2 + i, out_idx, BuildColValue(state.col_accum[i], bind_data.columns[i]));
 	}
 }
 
 static void ResetAccum(PivotRDFLocalState &state) {
-	for (idx_t i = 0; i < state.col_values.size(); i++) {
-		state.col_values[i].clear();
-		state.col_has_value[i] = false;
-	}
+	for (auto &a : state.col_accum)
+		a.Reset();
 }
 
 // ============================================================
@@ -446,6 +485,7 @@ static void PivotRDFFunc(ClientContext &context, TableFunctionInput &input, Data
 		std::string subject = ReadStr(1);
 		std::string predicate = ReadStr(2);
 		std::string object = ReadStr(3);
+		std::string lang = ReadStr(5);
 
 		if (state.has_pending && (graph != state.current_graph || subject != state.current_subject)) {
 			EmitRow(state, bind_data, output, out_idx++);
@@ -461,9 +501,19 @@ static void PivotRDFFunc(ClientContext &context, TableFunctionInput &input, Data
 		auto it = bind_data.pred_to_col.find(predicate);
 		if (it != bind_data.pred_to_col.end()) {
 			idx_t col_idx = it->second;
-			if (!state.col_has_value[col_idx]) {
-				state.col_values[col_idx] = object;
-				state.col_has_value[col_idx] = true;
+			PivotColAccum &accum = state.col_accum[col_idx];
+			const PivotColInfo &col = bind_data.columns[col_idx];
+			switch (col.kind) {
+			case PivotColKind::LANG_MAP:
+				accum.lang_map[lang] = object;
+				break;
+			case PivotColKind::SCALAR:
+				if (accum.values.empty())
+					accum.values.push_back(object);
+				break;
+			case PivotColKind::LIST:
+				accum.values.push_back(object);
+				break;
 			}
 		}
 	}
