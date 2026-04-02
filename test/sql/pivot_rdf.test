@@ -1,17 +1,24 @@
 # name: test/sql/pivot_rdf.test
-# description: bisect step 3 — real bind + real scan, all VARCHAR
+# description: bisect step 4 — real types (HUGEINT etc) but no MAP/LIST/UNION
 # group: [sql]
 
 require rdf
 
-# Test 1: error handling
 statement error
 SELECT * FROM pivot_rdf('not_exist.nt');
 ----
 IO Error: No files found matching: not_exist.nt
 
-# Test 2: full scan with all-VARCHAR columns
+# tests.nt has 4 subjects — foaf:age should be HUGEINT
 query I
 SELECT COUNT(*) FROM pivot_rdf('test/rdf/tests.nt');
 ----
 4
+
+# Check typed value works
+query I
+SELECT "http://xmlns.com/foaf/0.1/age"
+FROM pivot_rdf('test/rdf/tests.nt')
+WHERE subject = 'http://example.org/person/JohnDoe';
+----
+30

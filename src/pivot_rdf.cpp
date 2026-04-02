@@ -18,18 +18,98 @@
 namespace duckdb {
 
 // ============================================================
-// Bind data
+// Type mapping (simplified: no MAP, LIST, UNION)
 // ============================================================
+
+static LogicalType TypeNameToLogical(const std::string &name) {
+	if (name == "IRI" || name == "BLANK" || name == "VARCHAR")
+		return LogicalType::VARCHAR;
+	if (name == "BOOLEAN")
+		return LogicalType::BOOLEAN;
+	if (name == "TINYINT")
+		return LogicalType::TINYINT;
+	if (name == "SMALLINT")
+		return LogicalType::SMALLINT;
+	if (name == "INTEGER")
+		return LogicalType::INTEGER;
+	if (name == "BIGINT")
+		return LogicalType::BIGINT;
+	if (name == "HUGEINT")
+		return LogicalType::HUGEINT;
+	if (name == "FLOAT")
+		return LogicalType::FLOAT;
+	if (name == "DOUBLE")
+		return LogicalType::DOUBLE;
+	if (name == "DECIMAL")
+		return LogicalType::DOUBLE;
+	if (name == "DATE")
+		return LogicalType::DATE;
+	if (name == "TIMESTAMP")
+		return LogicalType::TIMESTAMP;
+	return LogicalType::VARCHAR;
+}
+
+// Derive a single scalar LogicalType for a predicate from its profile.
+// No MAP, LIST, or UNION — just pick the single most common type, or VARCHAR if mixed.
+static LogicalType DeriveScalarType(const PredicateProfile &profile) {
+	std::vector<LogicalType> distinct_types;
+	for (const auto &kv : profile.type_stats) {
+		LogicalType lt = TypeNameToLogical(kv.first);
+		bool already = false;
+		for (const auto &dt : distinct_types) {
+			if (dt == lt) { already = true; break; }
+		}
+		if (!already)
+			distinct_types.push_back(lt);
+	}
+	if (distinct_types.size() == 1)
+		return distinct_types[0];
+	// Mixed types -> VARCHAR
+	return LogicalType::VARCHAR;
+}
+
+// Convert string to typed Value
+static Value StringToTypedValue(const std::string &str, const LogicalType &target) {
+	if (target == LogicalType::VARCHAR)
+		return Value(str);
+	if (target == LogicalType::BOOLEAN)
+		return Value::BOOLEAN(str == "true" || str == "1");
+	try {
+		if (target == LogicalType::TINYINT)
+			return Value::TINYINT(static_cast<int8_t>(std::stoi(str)));
+		if (target == LogicalType::SMALLINT)
+			return Value::SMALLINT(static_cast<int16_t>(std::stoi(str)));
+		if (target == LogicalType::INTEGER)
+			return Value::INTEGER(static_cast<int32_t>(std::stoi(str)));
+		if (target == LogicalType::BIGINT)
+			return Value::BIGINT(static_cast<int64_t>(std::stoll(str)));
+		if (target == LogicalType::HUGEINT)
+			return Value::HUGEINT(static_cast<int64_t>(std::stoll(str)));
+		if (target == LogicalType::FLOAT)
+			return Value::FLOAT(std::stof(str));
+		if (target == LogicalType::DOUBLE)
+			return Value::DOUBLE(std::stod(str));
+	} catch (...) {
+		return Value(str);
+	}
+	return Value(str);
+}
+
+// ============================================================
+// State structs
+// ============================================================
+
+struct PivotColInfo {
+	std::string predicate;
+	LogicalType col_type;
+};
 
 struct PivotRDFBindData : public TableFunctionData {
 	vector<string> file_paths;
 	ITriplesBuffer::FileType file_type = ITriplesBuffer::UNKNOWN;
 	bool strict_parsing = true;
 	bool expand_prefixes = false;
-
-	// Predicate URIs in sorted order
-	std::vector<std::string> predicates;
-	// Fast lookup: predicate URI -> column index (offset from col 2)
+	std::vector<PivotColInfo> columns;
 	std::unordered_map<std::string, idx_t> pred_to_col;
 };
 
@@ -44,20 +124,18 @@ struct PivotRDFLocalState : public LocalTableFunctionState {
 	std::unique_ptr<ITriplesBuffer> ib;
 	DataChunk raw_chunk;
 	idx_t raw_chunk_pos = 0;
-	bool raw_chunk_initialized = false;
 
-	// Current subject being accumulated
 	std::string current_graph;
 	std::string current_subject;
 	bool has_pending = false;
 
-	// Per-predicate: first value seen (all VARCHAR for this bisect)
+	// Per-column: first value seen as string + whether set
 	std::vector<std::string> col_values;
 	std::vector<bool> col_has_value;
 };
 
 // ============================================================
-// Open file helper
+// Open file
 // ============================================================
 
 static unique_ptr<ITriplesBuffer> PivotOpenFile(const string &file_path, ITriplesBuffer::FileType ft, FileSystem &fs,
@@ -101,7 +179,7 @@ static unique_ptr<FunctionData> PivotRDFBind(ClientContext &context, TableFuncti
 	if (sp_it != input.named_parameters.end())
 		result->strict_parsing = sp_it->second.GetValue<bool>();
 
-	// Profile to discover predicates
+	// Profile
 	RDFProfileAccumulator accumulator;
 	for (auto &file_path : result->file_paths) {
 		ITriplesBuffer::FileType ft = result->file_type;
@@ -126,22 +204,30 @@ static unique_ptr<FunctionData> PivotRDFBind(ClientContext &context, TableFuncti
 		}
 	}
 
+	// Build columns with real types (but no MAP/LIST/UNION)
 	const auto &profiles = accumulator.GetProfiles();
+	std::vector<std::string> pred_uris;
 	for (const auto &kv : profiles)
-		result->predicates.push_back(kv.first);
-	std::sort(result->predicates.begin(), result->predicates.end());
+		pred_uris.push_back(kv.first);
+	std::sort(pred_uris.begin(), pred_uris.end());
 
-	for (idx_t i = 0; i < result->predicates.size(); i++)
-		result->pred_to_col[result->predicates[i]] = i;
+	for (const auto &pred : pred_uris) {
+		PivotColInfo col;
+		col.predicate = pred;
+		col.col_type = DeriveScalarType(profiles.at(pred));
+		result->columns.push_back(col);
+	}
+	for (idx_t i = 0; i < result->columns.size(); i++)
+		result->pred_to_col[result->columns[i].predicate] = i;
 
-	// Schema: graph + subject + one VARCHAR per predicate
+	// Schema
 	names.push_back("graph");
 	return_types.push_back(LogicalType::VARCHAR);
 	names.push_back("subject");
 	return_types.push_back(LogicalType::VARCHAR);
-	for (const auto &pred : result->predicates) {
-		names.push_back(pred);
-		return_types.push_back(LogicalType::VARCHAR);
+	for (const auto &col : result->columns) {
+		names.push_back(col.predicate);
+		return_types.push_back(col.col_type);
 	}
 
 	return std::move(result);
@@ -163,13 +249,12 @@ static unique_ptr<LocalTableFunctionState> PivotRDFLocalInit(ExecutionContext &c
                                                              GlobalTableFunctionState *) {
 	auto &bind_data = (PivotRDFBindData &)*input.bind_data;
 	auto state = make_uniq<PivotRDFLocalState>();
-	idx_t ncols = bind_data.predicates.size();
+	idx_t ncols = bind_data.columns.size();
 	state->col_values.resize(ncols);
 	state->col_has_value.resize(ncols, false);
 
 	vector<LogicalType> raw_types(6, LogicalType::VARCHAR);
 	state->raw_chunk.Initialize(Allocator::Get(context.client), raw_types);
-	state->raw_chunk_initialized = true;
 
 	return state;
 }
@@ -182,11 +267,12 @@ static void EmitRow(PivotRDFLocalState &state, const PivotRDFBindData &bind_data
                     DataChunk &output, idx_t out_idx) {
 	output.SetValue(0, out_idx, Value(state.current_graph));
 	output.SetValue(1, out_idx, Value(state.current_subject));
-	for (idx_t i = 0; i < bind_data.predicates.size(); i++) {
+	for (idx_t i = 0; i < bind_data.columns.size(); i++) {
 		if (state.col_has_value[i]) {
-			output.SetValue(2 + i, out_idx, Value(state.col_values[i]));
+			output.SetValue(2 + i, out_idx,
+			                StringToTypedValue(state.col_values[i], bind_data.columns[i].col_type));
 		} else {
-			output.SetValue(2 + i, out_idx, Value(LogicalType::VARCHAR));
+			output.SetValue(2 + i, out_idx, Value(bind_data.columns[i].col_type)); // typed NULL
 		}
 	}
 }
@@ -199,7 +285,7 @@ static void ResetAccum(PivotRDFLocalState &state) {
 }
 
 // ============================================================
-// Scan — all VARCHAR, no complex types
+// Scan
 // ============================================================
 
 static void PivotRDFFunc(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
@@ -211,7 +297,6 @@ static void PivotRDFFunc(ClientContext &context, TableFunctionInput &input, Data
 	idx_t out_idx = 0;
 
 	while (out_idx < STANDARD_VECTOR_SIZE) {
-		// Refill raw_chunk if needed
 		if (state.raw_chunk_pos >= state.raw_chunk.size()) {
 			if (state.ib) {
 				state.raw_chunk.Reset();
@@ -230,13 +315,11 @@ static void PivotRDFFunc(ClientContext &context, TableFunctionInput &input, Data
 				}
 			}
 
-			// Claim next file
 			idx_t file_idx;
 			{
 				std::lock_guard<std::mutex> lk(global_state.lock);
-				if (global_state.next_file >= global_state.file_count) {
+				if (global_state.next_file >= global_state.file_count)
 					break;
-				}
 				file_idx = global_state.next_file++;
 			}
 
@@ -262,7 +345,6 @@ static void PivotRDFFunc(ClientContext &context, TableFunctionInput &input, Data
 			}
 		}
 
-		// Process one triple
 		idx_t row = state.raw_chunk_pos++;
 
 		auto ReadStr = [&](idx_t col) -> std::string {
@@ -279,7 +361,6 @@ static void PivotRDFFunc(ClientContext &context, TableFunctionInput &input, Data
 		std::string predicate = ReadStr(2);
 		std::string object = ReadStr(3);
 
-		// Subject boundary
 		if (state.has_pending && (graph != state.current_graph || subject != state.current_subject)) {
 			EmitRow(state, bind_data, output, out_idx++);
 			ResetAccum(state);
@@ -291,7 +372,6 @@ static void PivotRDFFunc(ClientContext &context, TableFunctionInput &input, Data
 			state.has_pending = true;
 		}
 
-		// Accumulate: just store first value as VARCHAR
 		auto it = bind_data.pred_to_col.find(predicate);
 		if (it != bind_data.pred_to_col.end()) {
 			idx_t col_idx = it->second;
