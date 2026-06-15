@@ -25,11 +25,13 @@ jobs:
     name: Build extension binaries
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5.3
     with:
-      duckdb_version: v1.5.3
+      # Validation: consume the upstream fmt fix (duckdb PR #23238, merged to
+      # v1.5-variegata) instead of our local patch. ci-tools stays v1.5.3 for
+      # the Layer A vcvars fix. Swap back to a tag (v1.5.4) once released.
+      duckdb_version: v1.5-variegata
       ci_tools_version: v1.5.3
       extension_name: rdf
-      # EXPERIMENT: build only the MSVC windows_amd64 target to test the
-      # configure-time fmt patch (CMakeLists.txt) against VS 2026.
+      # Build only the MSVC windows_amd64 target to validate the upstream fix.
       exclude_archs: 'linux_amd64;linux_arm64;linux_amd64_musl;linux_arm64_musl;osx_amd64;osx_arm64;windows_arm64;windows_amd64_mingw;wasm_mvp;wasm_eh;wasm_threads'
 
   format-check:

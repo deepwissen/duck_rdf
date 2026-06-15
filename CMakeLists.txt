@@ -12,32 +12,6 @@ find_package(CURL REQUIRED)
 
 project(${TARGET_NAME} LANGUAGES C CXX)
 
-# ------------------------------------------------------------
-# VS 2026 workaround: patch DuckDB's vendored fmt at configure time.
-#
-# DuckDB's third_party/fmt guards a checked-iterator typedef with
-# `#ifdef _SECURE_SCL` and uses stdext::checked_array_iterator, which Visual
-# Studio 2026's STL removed. Because the guard tests presence (not value) and
-# VS 2026 still defines _SECURE_SCL (as 0), the dead branch is compiled and the
-# build fails. We cannot edit DuckDB upstream, but our CMake runs during
-# configure (before any compilation) and the DuckDB source is already checked
-# out, so we neutralise the guard in place. MSVC-only; the MinGW build already
-# takes the safe #else branch. Idempotent and re-applied on every fresh build.
-if (MSVC)
-    set(_DUCKDB_FMT_FORMAT_H "${CMAKE_SOURCE_DIR}/third_party/fmt/include/fmt/format.h")
-    if (EXISTS "${_DUCKDB_FMT_FORMAT_H}")
-        file(READ "${_DUCKDB_FMT_FORMAT_H}" _FMT_CONTENTS)
-        string(REPLACE
-            "#ifdef _SECURE_SCL"
-            "#if 0 // patched: VS 2026 removed stdext::checked_array_iterator"
-            _FMT_PATCHED "${_FMT_CONTENTS}")
-        if (NOT _FMT_CONTENTS STREQUAL _FMT_PATCHED)
-            file(WRITE "${_DUCKDB_FMT_FORMAT_H}" "${_FMT_PATCHED}")
-            message(STATUS "rdf: patched vendored fmt for VS 2026 (_SECURE_SCL / stdext)")
-        endif()
-    endif()
-endif()
-
 set(EXTENSION_NAME         ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
